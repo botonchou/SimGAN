@@ -1,9 +1,11 @@
+# -*- coding: utf-8 -*-
 """
 Implementation of `3.1 Appearance-based Gaze Estimation` from
 [Learning from Simulated and Unsupervised Images through Adversarial Training](https://arxiv.org/pdf/1612.07828v1.pdf).
 
 Note: Only Python 3 support currently.
 """
+from __future__ import print_function
 
 import os
 import sys
@@ -16,7 +18,7 @@ from keras.preprocessing import image
 import numpy as np
 import tensorflow as tf
 
-from dlutils import plot_image_batch_w_labels
+# from dlutils import plot_image_batch_w_labels
 
 from utils.image_history_buffer import ImageHistoryBuffer
 
@@ -25,8 +27,9 @@ from utils.image_history_buffer import ImageHistoryBuffer
 # directories
 #
 
-path = os.path.dirname(os.path.abspath(__file__))
-cache_dir = os.path.join(path, 'cache')
+# path = os.path.dirname(os.path.abspath(__file__))
+# cache_dir = os.path.join(path, 'cache')
+cache_dir = "/share/Research/gan-exp/eyes/"
 
 #
 # image dimensions
@@ -40,7 +43,8 @@ img_channels = 1
 # training params
 #
 
-nb_steps = 10000
+# nb_steps = 10000
+nb_steps = 100000
 batch_size = 512
 k_d = 1  # number of discriminator updates per step
 k_g = 2  # number of generative network updates per step
@@ -221,10 +225,12 @@ def adversarial_training(synthesis_eyes_dir, mpii_gaze_dir, refiner_model_path=N
                 print('Saving batch of refined images during pre-training at step: {}.'.format(i))
 
                 synthetic_image_batch = get_image_batch(synthetic_generator)
+                """
                 plot_image_batch_w_labels.plot_batch(
                     np.concatenate((synthetic_image_batch, refiner_model.predict_on_batch(synthetic_image_batch))),
                     os.path.join(cache_dir, figure_name),
                     label_batch=['Synthetic'] * batch_size + ['Refined'] * batch_size)
+                """
 
                 print('Refiner model self regularization loss: {}.'.format(gen_loss / log_interval))
                 gen_loss = np.zeros(shape=len(refiner_model.metrics_names))
@@ -298,11 +304,13 @@ def adversarial_training(synthesis_eyes_dir, mpii_gaze_dir, refiner_model_path=N
             figure_name = 'refined_image_batch_step_{}.png'.format(i)
             print('Saving batch of refined images at adversarial step: {}.'.format(i))
 
+            """
             synthetic_image_batch = get_image_batch(synthetic_generator)
             plot_image_batch_w_labels.plot_batch(
                 np.concatenate((synthetic_image_batch, refiner_model.predict_on_batch(synthetic_image_batch))),
                 os.path.join(cache_dir, figure_name),
                 label_batch=['Synthetic'] * batch_size + ['Refined'] * batch_size)
+            """
 
             # log loss summary
             print('Refiner model loss: {}.'.format(combined_loss / (log_interval * k_g * 2)))
