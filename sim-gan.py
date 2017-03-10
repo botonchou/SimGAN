@@ -1,55 +1,70 @@
+#!/usr/bin/python
 # -*- coding: utf-8 -*-
 """
 Implementation of `3.1 Appearance-based Gaze Estimation` from
 [Learning from Simulated and Unsupervised Images through Adversarial Training](https://arxiv.org/pdf/1612.07828v1.pdf).
-
-Note: Only Python 3 support currently.
 """
-from __future__ import print_function
 
 import os
 import sys
+import cv2
+import pprint
 
 from keras import applications
 from keras import layers
 from keras import models
 from keras import optimizers
 from keras.preprocessing import image
+
 import numpy as np
 import tensorflow as tf
+tf.logging.set_verbosity(tf.logging.INFO)
 
-# from dlutils import plot_image_batch_w_labels
-
+from dlutils import plot_image_batch_w_labels
 from utils.image_history_buffer import ImageHistoryBuffer
 
+tf.flags.DEFINE_string("exp-dir", None, "Directory to write models to")
+tf.flags.DEFINE_string("refiner-model-path", None, "Path to the refiner model .h5 file")
+tf.flags.DEFINE_string("discriminator-model-path", None, "Path to the discriminator model .h5 file")
+tf.flags.DEFINE_string("synthetic-data-dir", None, "Path to the synthesized data")
+tf.flags.DEFINE_string("real-data-dir", None, "Path to the real data")
 
-#
-# directories
-#
+tf.flags.DEFINE_boolean("display", True, "display image")
+tf.flags.DEFINE_boolean("shuffle", True, "shuffle images")
 
-# path = os.path.dirname(os.path.abspath(__file__))
-# cache_dir = os.path.join(path, 'cache')
-cache_dir = "/share/Research/gan-exp/eyes/"
+tf.flags.DEFINE_integer("log-every-nth", 100, "Log every nth iteration")
+tf.flags.DEFINE_integer("max-iter", 100000, "maximum training iterations")
+tf.flags.DEFINE_integer("start-iter", 0, "starting iteration count (temporary fix)")
 
-#
+tf.flags.DEFINE_integer("batch-size", 512, "size of mini-batch")
+tf.flags.DEFINE_integer("kd", 1, "number of discriminator updates per step")
+tf.flags.DEFINE_integer("kg", 2, "number of generative network updates per step")
+tf.flags.DEFINE_float("learning-rate", 0.001, "Learning rate")
+FLAGS = tf.flags.FLAGS
+
+assert FLAGS.exp_dir is not None
+
+FLAGS.model_dir = FLAGS.exp_dir + "/models/"
+FLAGS.vis_dir = FLAGS.exp_dir + "/vis/"
+
 # image dimensions
-#
-
 img_width = 55
 img_height = 35
 img_channels = 1
 
-#
 # training params
-#
+batch_size = FLAGS.batch_size
+log_interval = FLAGS.log_every_nth
 
-# nb_steps = 10000
-nb_steps = 100000
-batch_size = 512
-k_d = 1  # number of discriminator updates per step
-k_g = 2  # number of generative network updates per step
-log_interval = 100
+def get_image_batch(generator):
+    """keras generators may generate an incomplete batch for the last batch"""
+    img_batch = generator.next()
+    if len(img_batch) != batch_size:
+        img_batch = generator.next()
 
+    assert len(img_batch) == batch_size
+
+    return img_batch
 
 def refiner_network(input_image_tensor):
     """
@@ -106,52 +121,114 @@ def discriminator_network(input_image_tensor):
     # and the custom loss function is then `tf.nn.sparse_softmax_cross_entropy_with_logits`
     return layers.Reshape((-1, 2))(x)
 
+def get_data_generator(synthetic_data_dir, real_data_dir):
 
-def adversarial_training(synthesis_eyes_dir, mpii_gaze_dir, refiner_model_path=None, discriminator_model_path=None):
+    datagen = image.ImageDataGenerator(
+        preprocessing_function=applications.xception.preprocess_input,
+        dim_ordering='tf'
+    )
+
+    flow_from_directory_params = {
+        'target_size': (img_height, img_width),
+        'color_mode': 'grayscale' if img_channels == 1 else 'rgb',
+        'class_mode': None,
+        'batch_size': batch_size
+    }
+
+    synthetic_generator = datagen.flow_from_directory(
+        directory=synthetic_data_dir,
+        shuffle=FLAGS.shuffle,
+        **flow_from_directory_params
+    )
+
+    real_generator = datagen.flow_from_directory(
+        directory=real_data_dir,
+        shuffle=FLAGS.shuffle,
+        **flow_from_directory_params
+    )
+
+    return synthetic_generator, real_generator
+
+def pretrain_refiner(refiner_model, synthetic_generator):
+    # we first train the Rθ network with just self-regularization loss for 1,000 steps
+    print 'pre-training the refiner network...'
+    gen_loss = np.zeros(shape=len(refiner_model.metrics_names))
+
+    for i in range(1000):
+        synthetic_image_batch = get_image_batch(synthetic_generator)
+        gen_loss = np.add(refiner_model.train_on_batch(synthetic_image_batch, synthetic_image_batch), gen_loss)
+
+        # log every `log_interval` steps
+        if i % log_interval == 0:
+
+            if FLAGS.display:
+                fig_name = 'refined_image_batch_pre_train_step_{}.png'.format(i)
+                print 'Saving batch of refined images during pre-training at step: {}.'.format(i)
+                visualize_training_procedure(fig_name, synthetic_generator, refiner_model)
+
+            print 'Refiner model self regularization loss: {}.'.format(gen_loss / log_interval)
+            gen_loss = np.zeros(shape=len(refiner_model.metrics_names))
+
+def pretrain_discriminator(discriminator_model, real_generator, synthetic_generator):
+    # and Dφ for 200 steps (one mini-batch for refined images, another for real)
+    print 'pre-training the discriminator network...'
+    disc_loss = np.zeros(shape=len(discriminator_model.metrics_names))
+
+    for _ in range(100):
+        real_image_batch = get_image_batch(real_generator)
+        disc_loss = np.add(discriminator_model.train_on_batch(real_image_batch, y_real), disc_loss)
+
+        synthetic_image_batch = get_image_batch(synthetic_generator)
+        refined_image_batch = refiner_model.predict_on_batch(synthetic_image_batch)
+        disc_loss = np.add(discriminator_model.train_on_batch(refined_image_batch, y_refined), disc_loss)
+
+    # hard-coded for now
+    print 'Discriminator model loss: {}.'.format(disc_loss / (100 * 2))
+
+def adversarial_training(synthetic_data_dir, real_data_dir, refiner_model_path=None, discriminator_model_path=None):
     """Adversarial training of refiner network Rθ and discriminator network Dφ."""
-    #
-    # define model input and output tensors
-    #
 
+    # Define model input and output tensors
     synthetic_image_tensor = layers.Input(shape=(img_height, img_width, img_channels))
     refined_image_tensor = refiner_network(synthetic_image_tensor)
 
     refined_or_real_image_tensor = layers.Input(shape=(img_height, img_width, img_channels))
     discriminator_output = discriminator_network(refined_or_real_image_tensor)
 
-    #
-    # define models
-    #
+    # Define models
+    refiner_model = models.Model(
+        input=synthetic_image_tensor, output=refined_image_tensor,
+        name='refiner'
+    )
+    discriminator_model = models.Model(
+        input=refined_or_real_image_tensor, output=discriminator_output,
+        name='discriminator'
+    )
 
-    refiner_model = models.Model(input=synthetic_image_tensor, output=refined_image_tensor, name='refiner')
-    discriminator_model = models.Model(input=refined_or_real_image_tensor, output=discriminator_output,
-                                       name='discriminator')
-
-    # combined must output the refined image along w/ the disc's classification of it for the refiner's self-reg loss
+    # Combined must output the refined image along w/ the disc's classification of it for the refiner's self-reg loss
     refiner_model_output = refiner_model(synthetic_image_tensor)
     combined_output = discriminator_model(refiner_model_output)
-    combined_model = models.Model(input=synthetic_image_tensor, output=[refiner_model_output, combined_output],
-                                  name='combined')
+    combined_model = models.Model(
+        input=synthetic_image_tensor,
+        output=[refiner_model_output, combined_output],
+        name='combined'
+    )
 
     discriminator_model_output_shape = discriminator_model.output_shape
 
-    print(refiner_model.summary())
-    print(discriminator_model.summary())
-    print(combined_model.summary())
+    """
+    print refiner_model.summary()
+    print discriminator_model.summary()
+    print combined_model.summary()
+    """
 
-    #
-    # define custom l1 loss function for the refiner
-    #
-
+    # Define custom l1 loss function for the refiner
     def self_regularization_loss(y_true, y_pred):
         delta = 0.0001  # FIXME: need to figure out an appropriate value for this
         return tf.multiply(delta, tf.reduce_sum(tf.abs(y_pred - y_true)))
 
-    #
-    # define custom local adversarial loss (softmax for each image section) for the discriminator
+    # Define custom local adversarial loss (softmax for each image section) for the discriminator
     # the adversarial loss function is the sum of the cross-entropy losses over the local patches
-    #
-
     def local_adversarial_loss(y_true, y_pred):
         # y_true and y_pred have shape (batch_size, # of local patches, 2), but really we just want to average over
         # the local patches and batch size so we can reshape to (batch_size * # of local patches, 2)
@@ -161,103 +238,35 @@ def adversarial_training(synthesis_eyes_dir, mpii_gaze_dir, refiner_model_path=N
 
         return tf.reduce_mean(loss)
 
-    #
-    # compile models
-    #
-
-    sgd = optimizers.SGD(lr=0.001)
+    # Compile models
+    sgd = optimizers.SGD(lr=FLAGS.learning_rate)
 
     refiner_model.compile(optimizer=sgd, loss=self_regularization_loss)
     discriminator_model.compile(optimizer=sgd, loss=local_adversarial_loss)
     discriminator_model.trainable = False
     combined_model.compile(optimizer=sgd, loss=[self_regularization_loss, local_adversarial_loss])
 
-    #
-    # data generators
-    #
+    synthetic_generator, real_generator = get_data_generator(synthetic_data_dir, real_data_dir)
 
-    datagen = image.ImageDataGenerator(
-        preprocessing_function=applications.xception.preprocess_input,
-        dim_ordering='tf')
-
-    flow_from_directory_params = {'target_size': (img_height, img_width),
-                                  'color_mode': 'grayscale' if img_channels == 1 else 'rgb',
-                                  'class_mode': None,
-                                  'batch_size': batch_size}
-
-    synthetic_generator = datagen.flow_from_directory(
-        directory=synthesis_eyes_dir,
-        **flow_from_directory_params
-    )
-
-    real_generator = datagen.flow_from_directory(
-        directory=mpii_gaze_dir,
-        **flow_from_directory_params
-    )
-
-    def get_image_batch(generator):
-        """keras generators may generate an incomplete batch for the last batch"""
-        img_batch = generator.next()
-        if len(img_batch) != batch_size:
-            img_batch = generator.next()
-
-        assert len(img_batch) == batch_size
-
-        return img_batch
-
+    # TODO Should use one-sided smoothing suggested by Goodfellow
     # the target labels for the cross-entropy loss layer are 0 for every yj (real) and 1 for every xi (refined)
     y_real = np.array([[[1.0, 0.0]] * discriminator_model_output_shape[1]] * batch_size)
     y_refined = np.array([[[0.0, 1.0]] * discriminator_model_output_shape[1]] * batch_size)
     assert y_real.shape == (batch_size, discriminator_model_output_shape[1], 2)
 
-    if not refiner_model_path:
-        # we first train the Rθ network with just self-regularization loss for 1,000 steps
-        print('pre-training the refiner network...')
-        gen_loss = np.zeros(shape=len(refiner_model.metrics_names))
-
-        for i in range(1000):
-            synthetic_image_batch = get_image_batch(synthetic_generator)
-            gen_loss = np.add(refiner_model.train_on_batch(synthetic_image_batch, synthetic_image_batch), gen_loss)
-
-            # log every `log_interval` steps
-            if not i % log_interval:
-                figure_name = 'refined_image_batch_pre_train_step_{}.png'.format(i)
-                print('Saving batch of refined images during pre-training at step: {}.'.format(i))
-
-                synthetic_image_batch = get_image_batch(synthetic_generator)
-                """
-                plot_image_batch_w_labels.plot_batch(
-                    np.concatenate((synthetic_image_batch, refiner_model.predict_on_batch(synthetic_image_batch))),
-                    os.path.join(cache_dir, figure_name),
-                    label_batch=['Synthetic'] * batch_size + ['Refined'] * batch_size)
-                """
-
-                print('Refiner model self regularization loss: {}.'.format(gen_loss / log_interval))
-                gen_loss = np.zeros(shape=len(refiner_model.metrics_names))
-
-        refiner_model.save(os.path.join(cache_dir, 'refiner_model_pre_trained.h5'))
+    if refiner_model_path is None:
+        pretrain_refiner(refiner_model, synthetic_generator)
+        refiner_model.save(FLAGS.model_dir + 'refiner_model_pre_trained.h5')
     else:
-        refiner_model.load_weights(refiner_model_path)
+        tf.logging.info("Loading refiner model from {}".format(FLAGS.model_dir + refiner_model_path))
+        refiner_model.load_weights(FLAGS.model_dir + refiner_model_path)
 
-    if not discriminator_model_path:
-        # and Dφ for 200 steps (one mini-batch for refined images, another for real)
-        print('pre-training the discriminator network...')
-        disc_loss = np.zeros(shape=len(discriminator_model.metrics_names))
-
-        for _ in range(100):
-            real_image_batch = get_image_batch(real_generator)
-            disc_loss = np.add(discriminator_model.train_on_batch(real_image_batch, y_real), disc_loss)
-
-            synthetic_image_batch = get_image_batch(synthetic_generator)
-            refined_image_batch = refiner_model.predict_on_batch(synthetic_image_batch)
-            disc_loss = np.add(discriminator_model.train_on_batch(refined_image_batch, y_refined), disc_loss)
-
-        discriminator_model.save(os.path.join(cache_dir, 'discriminator_model_pre_trained.h5'))
-
-        # hard-coded for now
-        print('Discriminator model loss: {}.'.format(disc_loss / (100 * 2)))
+    if discriminator_model_path is None:
+        pretrain_discriminator(discriminator_model, real_generator, synthetic_generator)
+        discriminator_model.save(FLAGS.model_dir + 'discriminator_model_pre_trained.h5')
     else:
-        discriminator_model.load_weights(discriminator_model_path)
+        tf.logging.info("Loading discriminator model from {}".format(FLAGS.model_dir + discriminator_model_path))
+        discriminator_model.load_weights(FLAGS.model_dir + discriminator_model_path)
 
     # TODO: what is an appropriate size for the image history buffer?
     image_history_buffer = ImageHistoryBuffer((0, img_height, img_width, img_channels), batch_size * 100, batch_size)
@@ -267,11 +276,11 @@ def adversarial_training(synthesis_eyes_dir, mpii_gaze_dir, refiner_model_path=N
     disc_loss_refined = np.zeros(shape=len(discriminator_model.metrics_names))
 
     # see Algorithm 1 in https://arxiv.org/pdf/1612.07828v1.pdf
-    for i in range(nb_steps):
-        print('Step: {} of {}.'.format(i, nb_steps))
+    for i in range(FLAGS.start_iter, FLAGS.start_iter + FLAGS.max_iter):
+        print 'Step: {} of {}.'.format(i, FLAGS.start_iter + FLAGS.max_iter)
 
         # train the refiner
-        for _ in range(k_g * 2):
+        for _ in range(FLAGS.kg * 2):
             # sample a mini-batch of synthetic images
             synthetic_image_batch = get_image_batch(synthetic_generator)
 
@@ -279,7 +288,7 @@ def adversarial_training(synthesis_eyes_dir, mpii_gaze_dir, refiner_model_path=N
             combined_loss = np.add(combined_model.train_on_batch(synthetic_image_batch,
                                                                  [synthetic_image_batch, y_real]), combined_loss)
 
-        for _ in range(k_d):
+        for _ in range(FLAGS.kd):
             # sample a mini-batch of synthetic and real images
             synthetic_image_batch = get_image_batch(synthetic_generator)
             real_image_batch = get_image_batch(real_generator)
@@ -299,41 +308,82 @@ def adversarial_training(synthesis_eyes_dir, mpii_gaze_dir, refiner_model_path=N
             disc_loss_refined = np.add(discriminator_model.train_on_batch(refined_image_batch, y_refined),
                                        disc_loss_refined)
 
-        if not i % log_interval:
+        if i % log_interval == 0:
             # plot batch of refined images w/ current refiner
-            figure_name = 'refined_image_batch_step_{}.png'.format(i)
-            print('Saving batch of refined images at adversarial step: {}.'.format(i))
-
-            """
-            synthetic_image_batch = get_image_batch(synthetic_generator)
-            plot_image_batch_w_labels.plot_batch(
-                np.concatenate((synthetic_image_batch, refiner_model.predict_on_batch(synthetic_image_batch))),
-                os.path.join(cache_dir, figure_name),
-                label_batch=['Synthetic'] * batch_size + ['Refined'] * batch_size)
-            """
+            if FLAGS.display:
+                fig_name = 'refined_image_batch_step_{}.png'.format(i)
+                print 'Saving batch of refined images at adversarial step: {}.'.format(i)
+                visualize_training_procedure(fig_name, synthetic_generator, refiner_model)
 
             # log loss summary
-            print('Refiner model loss: {}.'.format(combined_loss / (log_interval * k_g * 2)))
-            print('Discriminator model loss real: {}.'.format(disc_loss_real / (log_interval * k_d * 2)))
-            print('Discriminator model loss refined: {}.'.format(disc_loss_refined / (log_interval * k_d * 2)))
+            print 'Refiner model loss: {}.'.format(combined_loss / (log_interval * FLAGS.kg * 2))
+            print 'Discriminator model loss real: {}.'.format(disc_loss_real / (log_interval * FLAGS.kd * 2))
+            print 'Discriminator model loss refined: {}.'.format(disc_loss_refined / (log_interval * FLAGS.kd * 2))
 
             combined_loss = np.zeros(shape=len(combined_model.metrics_names))
             disc_loss_real = np.zeros(shape=len(discriminator_model.metrics_names))
             disc_loss_refined = np.zeros(shape=len(discriminator_model.metrics_names))
 
             # save model checkpoints
-            model_checkpoint_base_name = os.path.join(cache_dir, '{}_model_step_{}.h5')
+            """
+            model_checkpoint_base_name = FLAGS.model_dir + '{}_model_step_{}.h5'
             refiner_model.save(model_checkpoint_base_name.format('refiner', i))
             discriminator_model.save(model_checkpoint_base_name.format('discriminator', i))
+            """
 
+def put_images_on_grid(images):
 
-def main(synthesis_eyes_dir, mpii_gaze_dir, refiner_model_path, discriminator_model_path):
-    adversarial_training(synthesis_eyes_dir, mpii_gaze_dir, refiner_model_path, discriminator_model_path)
+    n_images_per_row = 32
+    nb_columns = n_images_per_row
+    nb_rows = int(np.ceil(float(batch_size) / n_images_per_row))
 
+    # Turn (N, height, width) to (N, height, width, 1) for consistency
+    if images.ndim == 3:
+        images = images[..., None]
+
+    N, H, W, C = images.shape
+
+    grid = np.zeros((nb_rows * H, nb_columns * W, C), dtype=images.dtype)
+
+    for idx, image in enumerate(images):
+        i = idx // n_images_per_row
+        j = idx %  n_images_per_row
+        grid[i*H:(i+1)*H, j*W:(j+1)*W, ...] = image
+
+    # Normalize image based on min/max of images
+    minimum, maximum = np.min(images), np.max(images)
+    tf.logging.info("np.min(images) = {}, np.max(images) = {}".format(minimum, maximum))
+    grid = (grid - minimum) / (maximum - minimum)
+    grid = np.clip(grid * 255., 0, 255).astype(np.uint8)
+
+    return grid
+
+def visualize_training_procedure(fig_name, synthetic_generator, refiner_model):
+    fig_name = FLAGS.vis_dir + fig_name
+
+    synthetic_images = get_image_batch(synthetic_generator)
+    refined_images = refiner_model.predict_on_batch(synthetic_images)
+
+    simages = put_images_on_grid(synthetic_images)
+    divider = np.zeros((10, simages.shape[1], simages.shape[2]), dtype=np.uint8)
+    rimages = put_images_on_grid(refined_images)
+
+    fig = np.concatenate([simages, divider, rimages])
+
+    cv2.imwrite(fig_name, fig)
+
+def main(synthetic_data_dir, real_data_dir,
+         refiner_model_path, discriminator_model_path):
+
+    exp_config = pprint.pformat(FLAGS.__flags)
+    tf.logging.info(exp_config)
+
+    adversarial_training(synthetic_data_dir, real_data_dir,
+                         refiner_model_path, discriminator_model_path)
 
 if __name__ == '__main__':
     # TODO: if pre-trained models are passed in, we don't take the steps they've been trained for into account
-    refiner_model_path = sys.argv[3] if len(sys.argv) >= 4 else None
-    discriminator_model_path = sys.argv[4] if len(sys.argv) >= 5 else None
-
-    main(sys.argv[1], sys.argv[2], refiner_model_path, discriminator_model_path)
+    main(
+        FLAGS.synthetic_data_dir, FLAGS.real_data_dir,
+        FLAGS.refiner_model_path, FLAGS.discriminator_model_path
+    )
